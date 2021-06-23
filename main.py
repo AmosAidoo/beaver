@@ -1,7 +1,8 @@
 import socket
 import os
-import sys
 import argparse
+import queue
+import select
 
 argumentParser = argparse.ArgumentParser()
 argumentParser.add_argument("-a", "--address", type=str, help="host address. 127.0.0.1 by default")
@@ -13,6 +14,29 @@ args = argumentParser.parse_args()
 HOST = "127.0.0.1" if args.address is None else args.address
 PORT = 8000 if args.port is None else args.port
 ROOT_DIR = "./" if args.root is None else args.root
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setblocking(0)
+
+server_address = (HOST, PORT)
+server.bind(server_address)
+
+BUFFER = 1024
+
+print(f"Listening at {server_address[0]}:{server_address[1]}")
+
+print(server)
+
+# Sockets from which we expect to read
+inputs = [server]
+
+# Sockers from which we expect to write
+outputs = []
+
+# Outgoing message queues
+message_queues = {}
+
+server.listen(5)
 
 def parse_request(request):
     tokens = request.decode("utf8").split("\r\n")
@@ -60,39 +84,61 @@ def send_response(client_conn, request_line, headers, body):
     # Form the http response
     response = status_line + headers + body
     
-    print(response)
-    
     client_conn.sendall(response)
 
-print(f"Listening at port {PORT}")
+print(f"Listening at port {HOST}:{PORT}")
 
-while True:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, PORT))
-        s.listen()
+while inputs:
+    readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
-        conn, addr = s.accept()
-        
-        with conn:
-            print("Connected by", addr)
-            request = b""
-            BUFFER = 1024
+    # Handle inputs
+    for s in readable:
+        if s is server:
+            connection, client_address = s.accept()
+            print("New connection from", client_address)
+            connection.setblocking(0)
+            inputs.append(connection)
 
-            # Read the request from the client
-            while True:
-                data = conn.recv(BUFFER)
-                length = len(data)
-                request += data
-                
-                if data == b"":
-                    break
-                
-                # This is to detect the end of the request
-                # It seems to work though there might be some corner cases
-                # I will write some tests
-                if length < BUFFER and data[length - 1] == 0xA:
-                    break
+            message_queues[connection] = queue.Queue()
+        else:
+            data = s.recv(BUFFER)
+            if data:
+                message_queues[s].put(data)
 
+                if s not in outputs:
+                    outputs.append(s)
+            else:
+                # Interpret empty result as closed connection
+                print("Closing", client_address, "after reading no data")
+
+                if s in outputs:
+                    outputs.remove(s)
+                inputs.remove(s)
+                s.close()
+
+                # Remove message queue
+                del message_queues[s]
+
+    for s in writable:
+        try:
+            request = message_queues[s].get_nowait()
+        except queue.Empty:
+            print("Output queue for", s.getpeername(), "is empty")
+            outputs.remove(s)
+        else:
             request_line, headers, body = parse_request(request)
+            send_response(s, request_line, headers, body)
 
-            send_response(conn, request_line, headers, body)
+            if s in outputs:
+                outputs.remove(s)
+            inputs.remove(s)
+            s.close()
+
+    for s in exceptional:
+        print("Handling exceptional condition for", s.getpeername())
+        inputs.remove(s)
+        if s in outputs:
+            outputs.remove(s)
+        s.close()
+
+        del message_queues[s]
